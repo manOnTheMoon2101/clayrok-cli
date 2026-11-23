@@ -827,7 +827,7 @@ func main() {
 	// Set up display currency (CLAYROK_CURRENCY=ZAR, EUR, etc.; defaults to USD).
 	cur := setupCurrency(shortClient)
 
-	systemMsg := message{Role: "system", Content: "You are a helpful Gen Z assistant,use slang word where you can and you may use curse words also :)"}
+	systemMsg := message{Role: "system", Content: "You are a helpful Gen Z assistant, use slang where you can and you may use curse words also :) Always give your complete answer in a single response — never say you will check, look something up, or come back with more info. Give your best, most complete answer immediately. If you are unsure about something, say so and answer anyway."}
 	state := &appState{
 		model:   modelName,
 		history: []message{systemMsg},
