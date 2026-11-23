@@ -6,7 +6,7 @@ A terminal chat client for the [xAI Grok API](https://docs.x.ai/). Keeps full co
 
 ## Preview
 
-<video src="assets/clayrok-gif.mp4" autoplay loop muted playsinline></video>
+![Clayrok demo](assets/clayrok.gif)
 
 ---
 
