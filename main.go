@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/huh/spinner"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/term"
 	"github.com/joho/godotenv"
 )
 
@@ -28,11 +29,13 @@ const (
 
 // ── Palette ────────────────────────────────────────────────────────────────────
 var (
-	clrDark    = lipgloss.Color("#801336")
-	clrPrimary = lipgloss.Color("#C72C41")
-	clrAccent  = lipgloss.Color("#EE4540")
-	clrFg      = lipgloss.Color("#f5e6f0")
-	clrMuted   = lipgloss.Color("#a07890")
+	clrDark      = lipgloss.Color("#801336")
+	clrPrimary   = lipgloss.Color("#C72C41")
+	clrAccent    = lipgloss.Color("#EE4540")
+	clrFg        = lipgloss.Color("#f5e6f0")
+	clrMuted     = lipgloss.Color("#a07890")
+	clrBotBg     = lipgloss.Color("#8B0000")
+	clrSectionBg = lipgloss.Color("#180808")
 )
 
 // ── Styles ─────────────────────────────────────────────────────────────────────
@@ -45,19 +48,15 @@ var (
 	errStyle    = lipgloss.NewStyle().Foreground(clrDark).Bold(true)
 	mutedStyle  = lipgloss.NewStyle().Foreground(clrMuted)
 
-	// Message bubbles: left border clearly marks each speaker.
 	userBubble = lipgloss.NewStyle().
-			BorderLeft(true).
-			BorderStyle(lipgloss.NormalBorder()).
+			Border(lipgloss.RoundedBorder()).
 			BorderForeground(clrPrimary).
-			PaddingLeft(1).
+			Padding(0, 1).
 			Foreground(clrFg)
 
 	botBubble = lipgloss.NewStyle().
-			BorderLeft(true).
-			BorderStyle(lipgloss.NormalBorder()).
+			Border(lipgloss.RoundedBorder()).
 			BorderForeground(clrAccent).
-			PaddingLeft(1).
 			Foreground(clrFg)
 )
 
@@ -560,10 +559,35 @@ func printUserMsg(input string) {
 		userBubble.Render(input))
 }
 
+// getTermWidth tries all three standard fds and falls back to 80.
+func getTermWidth() int {
+	for _, fd := range []uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()} {
+		if w, _, err := term.GetSize(fd); err == nil && w > 0 {
+			return w
+		}
+	}
+	return 80
+}
+
 func printBotMsg(name, reply string) {
-	fmt.Printf("\n%s\n%s\n\n",
-		botStyle.Render(name),
-		botBubble.Render(reply))
+	w := getTermWidth()
+
+	nameLabel := lipgloss.NewStyle().
+		Foreground(clrAccent).
+		Bold(true).
+		Render(name)
+
+	// Width: terminal - border(2) - padding(4) = w-6
+	section := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(clrDark).
+		Background(clrSectionBg).
+		Width(w-6).
+		Padding(1, 2).
+		Foreground(clrFg).
+		Render(nameLabel + "\n\n" + reply)
+
+	fmt.Printf("\n%s\n\n", section)
 }
 
 // ── Env / setup ────────────────────────────────────────────────────────────────
@@ -803,7 +827,7 @@ func main() {
 	// Set up display currency (CLAYROK_CURRENCY=ZAR, EUR, etc.; defaults to USD).
 	cur := setupCurrency(shortClient)
 
-	systemMsg := message{Role: "system", Content: "You are a helpful assistant."}
+	systemMsg := message{Role: "system", Content: "You are a helpful Gen Z assistant,use slang word where you can and you may use curse words also :)"}
 	state := &appState{
 		model:   modelName,
 		history: []message{systemMsg},
