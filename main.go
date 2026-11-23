@@ -18,21 +18,24 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/huh/spinner"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/term"
 	"github.com/joho/godotenv"
 )
 
 const (
-	apiURL  = "https://api.x.ai/v1/chat/completions"
+	apiURL  = "https://api.x.ai/v1/responses"
 	mgmtURL = "https://management-api.x.ai"
 )
 
 // ── Palette ────────────────────────────────────────────────────────────────────
 var (
-	clrDark    = lipgloss.Color("#801336")
-	clrPrimary = lipgloss.Color("#C72C41")
-	clrAccent  = lipgloss.Color("#EE4540")
-	clrFg      = lipgloss.Color("#f5e6f0")
-	clrMuted   = lipgloss.Color("#a07890")
+	clrDark      = lipgloss.Color("#801336")
+	clrPrimary   = lipgloss.Color("#C72C41")
+	clrAccent    = lipgloss.Color("#EE4540")
+	clrFg        = lipgloss.Color("#f5e6f0")
+	clrMuted     = lipgloss.Color("#a07890")
+	clrBotBg     = lipgloss.Color("#8B0000")
+	clrSectionBg = lipgloss.Color("#180808")
 )
 
 // ── Styles ─────────────────────────────────────────────────────────────────────
@@ -45,19 +48,15 @@ var (
 	errStyle    = lipgloss.NewStyle().Foreground(clrDark).Bold(true)
 	mutedStyle  = lipgloss.NewStyle().Foreground(clrMuted)
 
-	// Message bubbles: left border clearly marks each speaker.
 	userBubble = lipgloss.NewStyle().
-			BorderLeft(true).
-			BorderStyle(lipgloss.NormalBorder()).
+			Border(lipgloss.RoundedBorder()).
 			BorderForeground(clrPrimary).
-			PaddingLeft(1).
+			Padding(0, 1).
 			Foreground(clrFg)
 
 	botBubble = lipgloss.NewStyle().
-			BorderLeft(true).
-			BorderStyle(lipgloss.NormalBorder()).
+			Border(lipgloss.RoundedBorder()).
 			BorderForeground(clrAccent).
-			PaddingLeft(1).
 			Foreground(clrFg)
 )
 
@@ -69,6 +68,7 @@ type cmdEntry struct {
 
 var cmdEntries = []cmdEntry{
 	{"/clear", "Clear the conversation and start a fresh session"},
+	{"/config", "View and edit API keys and settings"},
 	{"/help", "Show this help message"},
 	{"/model", "List and switch the active model"},
 }
@@ -173,113 +173,58 @@ func runPicker(entries []pickerEntry) string {
 	return ""
 }
 
-// ── Currency ───────────────────────────────────────────────────────────────────
-
-type currency struct {
-	code   string
-	symbol string
-	rate   float64 // conversion rate from USD (1 USD = rate units)
-}
-
-// knownSymbol returns the display symbol for a currency code.
-func knownSymbol(code string) string {
-	switch code {
-	case "USD":
-		return "$"
-	case "ZAR":
-		return "R"
-	case "EUR":
-		return "€"
-	case "GBP":
-		return "£"
-	case "JPY", "CNY":
-		return "¥"
-	case "CAD":
-		return "C$"
-	case "AUD":
-		return "A$"
-	case "CHF":
-		return "Fr"
-	case "INR":
-		return "₹"
-	case "BRL":
-		return "R$"
-	default:
-		return code + " "
-	}
-}
-
-type erAPIResp struct {
-	Result string             `json:"result"`
-	Rates  map[string]float64 `json:"rates"`
-}
-
-// fetchExchangeRate fetches a live rate from open.er-api.com (free, no key).
-func fetchExchangeRate(client *http.Client, from, to string) (float64, error) {
-	if from == to {
-		return 1.0, nil
-	}
-	url := fmt.Sprintf("https://open.er-api.com/v6/latest/%s", from)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return 1.0, err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 1.0, err
-	}
-	defer resp.Body.Close()
-
-	var out erAPIResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 1.0, err
-	}
-	rate, ok := out.Rates[to]
-	if !ok {
-		return 1.0, fmt.Errorf("currency %q not found in exchange rate response", to)
-	}
-	return rate, nil
-}
-
-// setupCurrency reads CLAYROK_CURRENCY and fetches a live rate when needed.
-func setupCurrency(client *http.Client) currency {
-	code := strings.ToUpper(strings.TrimSpace(os.Getenv("CLAYROK_CURRENCY")))
-	if code == "" {
-		code = "USD"
-	}
-	sym := knownSymbol(code)
-	if code == "USD" {
-		return currency{code: "USD", symbol: sym, rate: 1.0}
-	}
-	rate, err := fetchExchangeRate(client, "USD", code)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s\n",
-			mutedStyle.Render("currency: could not fetch "+code+" rate, falling back to USD"))
-		return currency{code: "USD", symbol: "$", rate: 1.0}
-	}
-	return currency{code: code, symbol: sym, rate: rate}
-}
-
 // ── API types ──────────────────────────────────────────────────────────────────
 type message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-type chatRequest struct {
-	Model    string    `json:"model"`
-	Messages []message `json:"messages"`
+// Responses API request (replaces the old chat completions format).
+type responsesRequest struct {
+	Model        string    `json:"model"`
+	Instructions string    `json:"instructions,omitempty"`
+	Input        []message `json:"input"`
+	Tools        []tool    `json:"tools,omitempty"`
 }
 
-type chatResponse struct {
-	Choices []struct {
-		Message message `json:"message"`
-	} `json:"choices"`
-	Error any `json:"error"`
+type tool struct {
+	Type string `json:"type"`
+}
+
+type contentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type outputItem struct {
+	Type    string        `json:"type"`
+	Role    string        `json:"role,omitempty"`
+	Content []contentPart `json:"content,omitempty"`
+}
+
+type responsesOutput struct {
+	Output []outputItem `json:"output"`
+	Error  any          `json:"error"`
 }
 
 func ask(client *http.Client, apiKey, model string, msgs []message) (string, error) {
-	body, err := json.Marshal(chatRequest{Model: model, Messages: msgs})
+	// Separate the system message (→ instructions) from conversation history.
+	var instructions string
+	var input []message
+	for _, m := range msgs {
+		if m.Role == "system" {
+			instructions = m.Content
+		} else {
+			input = append(input, m)
+		}
+	}
+
+	body, err := json.Marshal(responsesRequest{
+		Model:        model,
+		Instructions: instructions,
+		Input:        input,
+		Tools:        []tool{{Type: "web_search"}},
+	})
 	if err != nil {
 		return "", err
 	}
@@ -303,14 +248,24 @@ func ask(client *http.Client, apiKey, model string, msgs []message) (string, err
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("API returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
 	}
-	var out chatResponse
+
+	var out responsesOutput
 	if err := json.Unmarshal(data, &out); err != nil {
 		return "", err
 	}
-	if len(out.Choices) == 0 {
-		return "", errors.New("API returned no choices")
+
+	// Find the assistant's text in the output items.
+	for _, item := range out.Output {
+		if item.Type == "message" && item.Role == "assistant" {
+			for _, c := range item.Content {
+				// xAI uses "output_text"; fall back to plain "text" just in case.
+				if c.Type == "output_text" || c.Type == "text" {
+					return c.Text, nil
+				}
+			}
+		}
 	}
-	return out.Choices[0].Message.Content, nil
+	return "", errors.New("API returned no text in response")
 }
 
 // ── Language models ────────────────────────────────────────────────────────────
@@ -515,25 +470,26 @@ func fetchBalance(client *http.Client, mgmtKey, teamID string) (float64, float64
 	return dollars, pct, nil
 }
 
-func formatCredits(dollars, pct float64, cur currency) string {
-	amount := dollars * cur.rate
-	bal := lipgloss.NewStyle().Foreground(clrFg).Bold(true).
-		Render(fmt.Sprintf("%s%.2f", cur.symbol, amount))
-	if pct > 0 {
-		var pctColor lipgloss.Color
-		switch {
-		case pct > 50:
-			pctColor = clrAccent
-		case pct > 20:
-			pctColor = clrPrimary
-		default:
-			pctColor = clrDark
-		}
-		pctStr := lipgloss.NewStyle().Foreground(pctColor).
-			Render(fmt.Sprintf("(%.0f%%)", pct))
-		return bal + " " + pctStr
+func formatCredits(dollars, pct float64) string {
+	if pct < 0 {
+		return ""
 	}
-	return bal
+	// Show how much has been consumed, not how much remains.
+	usedPct := 100 - pct
+	if usedPct < 0 {
+		usedPct = 0
+	}
+	var pctColor lipgloss.Color
+	switch {
+	case usedPct < 25:
+		pctColor = clrAccent // mostly full — good
+	case usedPct < 60:
+		pctColor = clrPrimary // halfway through — caution
+	default:
+		pctColor = clrDark // running low — warning
+	}
+	return lipgloss.NewStyle().Foreground(pctColor).Bold(true).
+		Render(fmt.Sprintf("%.0f%% used", usedPct))
 }
 
 // ── App state ──────────────────────────────────────────────────────────────────
@@ -548,7 +504,7 @@ func printStatus(state *appState) {
 	fmt.Println(mutedStyle.Render(strings.Repeat("─", 48)))
 	line := mutedStyle.Render("model: ") + headerStyle.Render(state.model)
 	if state.creditStr != "" {
-		line += mutedStyle.Render("  ·  credits: ") + state.creditStr
+		line += mutedStyle.Render("  ·  spent: ") + state.creditStr
 	}
 	fmt.Println(line)
 }
@@ -559,10 +515,35 @@ func printUserMsg(input string) {
 		userBubble.Render(input))
 }
 
+// getTermWidth tries all three standard fds and falls back to 80.
+func getTermWidth() int {
+	for _, fd := range []uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()} {
+		if w, _, err := term.GetSize(fd); err == nil && w > 0 {
+			return w
+		}
+	}
+	return 80
+}
+
 func printBotMsg(name, reply string) {
-	fmt.Printf("\n%s\n%s\n\n",
-		botStyle.Render(name),
-		botBubble.Render(reply))
+	w := getTermWidth()
+
+	nameLabel := lipgloss.NewStyle().
+		Foreground(clrAccent).
+		Bold(true).
+		Render(name)
+
+	// Width: terminal - border(2) - padding(4) = w-6
+	section := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(clrDark).
+		Background(clrSectionBg).
+		Width(w-6).
+		Padding(1, 2).
+		Foreground(clrFg).
+		Render(nameLabel + "\n\n" + reply)
+
+	fmt.Printf("\n%s\n\n", section)
 }
 
 // ── Env / setup ────────────────────────────────────────────────────────────────
@@ -603,7 +584,7 @@ func pickModel(state *appState, models []langModel) {
 	}
 }
 
-func runCommand(cmd string, state *appState, systemMsg message, models []langModel) {
+func runCommand(cmd string, state *appState, systemMsg message, models []langModel, shortClient *http.Client) {
 	switch cmd {
 	case "/clear":
 		state.history = []message{systemMsg}
@@ -612,8 +593,144 @@ func runCommand(cmd string, state *appState, systemMsg message, models []langMod
 		showCommands()
 	case "/model":
 		pickModel(state, models)
+	case "/config":
+		runConfig(state, shortClient)
 	default:
 		fmt.Println(errStyle.Render("Unknown command: " + cmd))
+	}
+}
+
+// ── Config ─────────────────────────────────────────────────────────────────────
+
+func runConfig(state *appState, shortClient *http.Client) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		fmt.Println(errStyle.Render("Could not find config directory: " + err.Error()))
+		return
+	}
+	configPath := filepath.Join(configDir, "clayrok", ".env")
+
+	fmt.Println()
+	fmt.Println(headerStyle.Render("Configuration"))
+	fmt.Println(mutedStyle.Render("Settings are saved to: " + configPath))
+	fmt.Println()
+
+	// Pre-fill with current values so the user can see and edit them.
+	newAPIKey := os.Getenv("XAI_API_KEY")
+	newModel := os.Getenv("GROK_MODEL")
+	if newModel == "" {
+		newModel = "grok-3"
+	}
+	newMgmtKey := os.Getenv("XAI_MANAGEMENT_KEY")
+	newTeamID := os.Getenv("XAI_TEAM_ID")
+	if newTeamID == "" {
+		newTeamID = "default"
+	}
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewNote().
+			Title("Required").
+			Description("Your xAI inference key — used for all chat requests.\nGet one at console.x.ai → API Keys."),
+		huh.NewInput().
+			Title("XAI_API_KEY").
+			Description("Required for Clayrok to work at all.").
+			Placeholder("xai-...").
+			EchoMode(huh.EchoModePassword).
+			Value(&newAPIKey),
+		huh.NewInput().
+			Title("GROK_MODEL").
+			Description("Default model to use (you can switch any time with /model).").
+			Placeholder("grok-3").
+			Value(&newModel),
+	),
+		huh.NewGroup(
+			huh.NewNote().
+				Title("Credit balance display (optional)").
+				Description(
+					"These two keys enable the credit balance shown in the status bar.\n\n"+
+						"1. Go to console.x.ai → Settings → Management Keys\n"+
+						"2. Create a key with Billing Read permission\n"+
+						"3. Paste it below\n\n"+
+						"Your Team ID is in the console URL: /team/<id>/..."),
+			huh.NewInput().
+				Title("XAI_MANAGEMENT_KEY").
+				Description("Management key with Billing Read permission.").
+				Placeholder("xai-mgmt-...").
+				EchoMode(huh.EchoModePassword).
+				Value(&newMgmtKey),
+			huh.NewInput().
+				Title("XAI_TEAM_ID").
+				Description("From the console URL — leave as 'default' if unsure.").
+				Placeholder("default").
+				Value(&newTeamID),
+		),
+	).WithTheme(clayrokTheme()).WithShowHelp(false)
+
+	if err := form.Run(); err != nil {
+		fmt.Println(mutedStyle.Render("Config cancelled."))
+		return
+	}
+
+	// Apply defaults for optional fields left blank.
+	if newModel == "" {
+		newModel = "grok-3"
+	}
+	if newTeamID == "" {
+		newTeamID = "default"
+	}
+
+	// Build .env content.
+	var buf strings.Builder
+	writeLine := func(k, v string) {
+		if v != "" {
+			fmt.Fprintf(&buf, "%s=%s\n", k, v)
+		}
+	}
+	writeLine("XAI_API_KEY", newAPIKey)
+	writeLine("GROK_MODEL", newModel)
+	writeLine("XAI_MANAGEMENT_KEY", newMgmtKey)
+	writeLine("XAI_TEAM_ID", newTeamID)
+
+	// Ensure the directory exists.
+	if err := os.MkdirAll(filepath.Join(configDir, "clayrok"), 0700); err != nil {
+		fmt.Println(errStyle.Render("Could not create config directory: " + err.Error()))
+		return
+	}
+	if err := os.WriteFile(configPath, []byte(buf.String()), 0600); err != nil {
+		fmt.Println(errStyle.Render("Could not save config: " + err.Error()))
+		return
+	}
+
+	fmt.Printf("\n%s %s\n",
+		headerStyle.Render("✓ Saved to"),
+		mutedStyle.Render(configPath))
+
+	// Update in-memory env so the rest of the session benefits immediately.
+	os.Setenv("XAI_API_KEY", newAPIKey)
+	os.Setenv("GROK_MODEL", newModel)
+	os.Setenv("XAI_MANAGEMENT_KEY", newMgmtKey)
+	os.Setenv("XAI_TEAM_ID", newTeamID)
+
+	// Update active model in state if it changed.
+	if newModel != "" && newModel != state.model {
+		state.model = newModel
+		fmt.Printf("%s %s\n",
+			mutedStyle.Render("Model updated to"),
+			headerStyle.Render(newModel))
+	}
+
+	// Re-fetch credits immediately so the status bar updates without a restart.
+	if newMgmtKey != "" {
+		dollars, pct, err := fetchBalance(shortClient, newMgmtKey, newTeamID)
+		if err != nil {
+			state.creditStr = errStyle.Render("unavailable")
+		} else if dollars > 0 {
+			state.creditStr = formatCredits(dollars, pct)
+			fmt.Printf("%s %s\n",
+				mutedStyle.Render("Credits:"),
+				state.creditStr)
+		}
+	} else {
+		state.creditStr = ""
 	}
 }
 
@@ -641,10 +758,7 @@ func main() {
 	shortClient := &http.Client{Timeout: 10 * time.Second}
 	longClient := &http.Client{Timeout: 120 * time.Second}
 
-	// Set up display currency (CLAYROK_CURRENCY=ZAR, EUR, etc.; defaults to USD).
-	cur := setupCurrency(shortClient)
-
-	systemMsg := message{Role: "system", Content: "You are a helpful assistant."}
+	systemMsg := message{Role: "system", Content: "You are a helpful Gen Z assistant, use slang where you can and you may use curse words also :) Always give your complete answer in a single response — never say you will check, look something up, or come back with more info. Give your best, most complete answer immediately. If you are unsure about something, say so and answer anyway."}
 	state := &appState{
 		model:   modelName,
 		history: []message{systemMsg},
@@ -661,7 +775,7 @@ func main() {
 				errStyle.Render(err.Error()))
 		} else if dollars > 0 {
 			// Only show when there is an actual prepaid balance.
-			state.creditStr = formatCredits(dollars, pct, cur)
+			state.creditStr = formatCredits(dollars, pct)
 		}
 	}
 
@@ -706,7 +820,7 @@ func main() {
 				entries[i] = pickerEntry{name: c.name, desc: c.desc}
 			}
 			if selected := runPicker(entries); selected != "" {
-				runCommand(selected, state, systemMsg, models)
+				runCommand(selected, state, systemMsg, models, shortClient)
 			}
 			continue
 		}
@@ -716,7 +830,7 @@ func main() {
 			for _, cmd := range commands {
 				if cmd == input {
 					known = true
-					runCommand(input, state, systemMsg, models)
+					runCommand(input, state, systemMsg, models, shortClient)
 					break
 				}
 			}
@@ -726,7 +840,7 @@ func main() {
 					entries[i] = pickerEntry{name: c.name, desc: c.desc}
 				}
 				if selected := runPicker(entries); selected != "" {
-					runCommand(selected, state, systemMsg, models)
+					runCommand(selected, state, systemMsg, models, shortClient)
 				}
 			}
 			continue
