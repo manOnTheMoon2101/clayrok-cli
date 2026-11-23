@@ -69,6 +69,7 @@ type cmdEntry struct {
 
 var cmdEntries = []cmdEntry{
 	{"/clear", "Clear the conversation and start a fresh session"},
+	{"/config", "View and edit API keys and settings"},
 	{"/help", "Show this help message"},
 	{"/model", "List and switch the active model"},
 }
@@ -603,7 +604,7 @@ func pickModel(state *appState, models []langModel) {
 	}
 }
 
-func runCommand(cmd string, state *appState, systemMsg message, models []langModel) {
+func runCommand(cmd string, state *appState, systemMsg message, models []langModel, shortClient *http.Client) {
 	switch cmd {
 	case "/clear":
 		state.history = []message{systemMsg}
@@ -612,8 +613,166 @@ func runCommand(cmd string, state *appState, systemMsg message, models []langMod
 		showCommands()
 	case "/model":
 		pickModel(state, models)
+	case "/config":
+		runConfig(state, shortClient)
 	default:
 		fmt.Println(errStyle.Render("Unknown command: " + cmd))
+	}
+}
+
+// ── Config ─────────────────────────────────────────────────────────────────────
+
+func runConfig(state *appState, shortClient *http.Client) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		fmt.Println(errStyle.Render("Could not find config directory: " + err.Error()))
+		return
+	}
+	configPath := filepath.Join(configDir, "clayrok", ".env")
+
+	fmt.Println()
+	fmt.Println(headerStyle.Render("Configuration"))
+	fmt.Println(mutedStyle.Render("Settings are saved to: " + configPath))
+	fmt.Println()
+
+	// Pre-fill with current values so the user can see and edit them.
+	newAPIKey := os.Getenv("XAI_API_KEY")
+	newModel := os.Getenv("GROK_MODEL")
+	if newModel == "" {
+		newModel = "grok-3"
+	}
+	newMgmtKey := os.Getenv("XAI_MANAGEMENT_KEY")
+	newTeamID := os.Getenv("XAI_TEAM_ID")
+	if newTeamID == "" {
+		newTeamID = "default"
+	}
+	newCurrency := os.Getenv("CLAYROK_CURRENCY")
+	if newCurrency == "" {
+		newCurrency = "USD"
+	}
+
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewNote().
+				Title("Required").
+				Description("Your xAI inference key — used for all chat requests.\nGet one at console.x.ai → API Keys."),
+			huh.NewInput().
+				Title("XAI_API_KEY").
+				Description("Required for Clayrok to work at all.").
+				Placeholder("xai-...").
+				EchoMode(huh.EchoModePassword).
+				Value(&newAPIKey),
+			huh.NewInput().
+				Title("GROK_MODEL").
+				Description("Default model to use (you can switch any time with /model).").
+				Placeholder("grok-3").
+				Value(&newModel),
+		),
+		huh.NewGroup(
+			huh.NewNote().
+				Title("Credit balance display (optional)").
+				Description(
+					"These two keys enable the credit balance shown in the status bar.\n\n"+
+						"1. Go to console.x.ai → Settings → Management Keys\n"+
+						"2. Create a key with Billing Read permission\n"+
+						"3. Paste it below\n\n"+
+						"Your Team ID is in the console URL: /team/<id>/..."),
+			huh.NewInput().
+				Title("XAI_MANAGEMENT_KEY").
+				Description("Management key with Billing Read permission.").
+				Placeholder("xai-mgmt-...").
+				EchoMode(huh.EchoModePassword).
+				Value(&newMgmtKey),
+			huh.NewInput().
+				Title("XAI_TEAM_ID").
+				Description("From the console URL — leave as 'default' if unsure.").
+				Placeholder("default").
+				Value(&newTeamID),
+		),
+		huh.NewGroup(
+			huh.NewNote().
+				Title("Display currency (optional)").
+				Description("Credit amounts are shown in USD by default.\nSet any ISO 4217 code to convert using live rates.\nExamples: ZAR, EUR, GBP, JPY, CAD, AUD, INR, BRL"),
+			huh.NewInput().
+				Title("CLAYROK_CURRENCY").
+				Description("ISO 4217 currency code.").
+				Placeholder("USD").
+				Value(&newCurrency),
+		),
+	).WithTheme(clayrokTheme()).WithShowHelp(false)
+
+	if err := form.Run(); err != nil {
+		fmt.Println(mutedStyle.Render("Config cancelled."))
+		return
+	}
+
+	// Apply defaults for optional fields left blank.
+	if newModel == "" {
+		newModel = "grok-3"
+	}
+	if newTeamID == "" {
+		newTeamID = "default"
+	}
+	if newCurrency == "" {
+		newCurrency = "USD"
+	}
+
+	// Build .env content.
+	var buf strings.Builder
+	writeLine := func(k, v string) {
+		if v != "" {
+			fmt.Fprintf(&buf, "%s=%s\n", k, v)
+		}
+	}
+	writeLine("XAI_API_KEY", newAPIKey)
+	writeLine("GROK_MODEL", newModel)
+	writeLine("XAI_MANAGEMENT_KEY", newMgmtKey)
+	writeLine("XAI_TEAM_ID", newTeamID)
+	writeLine("CLAYROK_CURRENCY", newCurrency)
+
+	// Ensure the directory exists.
+	if err := os.MkdirAll(filepath.Join(configDir, "clayrok"), 0700); err != nil {
+		fmt.Println(errStyle.Render("Could not create config directory: " + err.Error()))
+		return
+	}
+	if err := os.WriteFile(configPath, []byte(buf.String()), 0600); err != nil {
+		fmt.Println(errStyle.Render("Could not save config: " + err.Error()))
+		return
+	}
+
+	fmt.Printf("\n%s %s\n",
+		headerStyle.Render("✓ Saved to"),
+		mutedStyle.Render(configPath))
+
+	// Update in-memory env so the rest of the session benefits immediately.
+	os.Setenv("XAI_API_KEY", newAPIKey)
+	os.Setenv("GROK_MODEL", newModel)
+	os.Setenv("XAI_MANAGEMENT_KEY", newMgmtKey)
+	os.Setenv("XAI_TEAM_ID", newTeamID)
+	os.Setenv("CLAYROK_CURRENCY", newCurrency)
+
+	// Update active model in state if it changed.
+	if newModel != "" && newModel != state.model {
+		state.model = newModel
+		fmt.Printf("%s %s\n",
+			mutedStyle.Render("Model updated to"),
+			headerStyle.Render(newModel))
+	}
+
+	// Re-fetch credits immediately so the status bar updates without a restart.
+	if newMgmtKey != "" {
+		cur := setupCurrency(shortClient)
+		dollars, pct, err := fetchBalance(shortClient, newMgmtKey, newTeamID)
+		if err != nil {
+			state.creditStr = errStyle.Render("unavailable")
+		} else if dollars > 0 {
+			state.creditStr = formatCredits(dollars, pct, cur)
+			fmt.Printf("%s %s\n",
+				mutedStyle.Render("Credits:"),
+				state.creditStr)
+		}
+	} else {
+		state.creditStr = ""
 	}
 }
 
@@ -706,7 +865,7 @@ func main() {
 				entries[i] = pickerEntry{name: c.name, desc: c.desc}
 			}
 			if selected := runPicker(entries); selected != "" {
-				runCommand(selected, state, systemMsg, models)
+				runCommand(selected, state, systemMsg, models, shortClient)
 			}
 			continue
 		}
@@ -716,7 +875,7 @@ func main() {
 			for _, cmd := range commands {
 				if cmd == input {
 					known = true
-					runCommand(input, state, systemMsg, models)
+					runCommand(input, state, systemMsg, models, shortClient)
 					break
 				}
 			}
@@ -726,7 +885,7 @@ func main() {
 					entries[i] = pickerEntry{name: c.name, desc: c.desc}
 				}
 				if selected := runPicker(entries); selected != "" {
-					runCommand(selected, state, systemMsg, models)
+					runCommand(selected, state, systemMsg, models, shortClient)
 				}
 			}
 			continue
