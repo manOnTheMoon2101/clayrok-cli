@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	apiURL  = "https://api.x.ai/v1/chat/completions"
+	apiURL  = "https://api.x.ai/v1/responses"
 	mgmtURL = "https://management-api.x.ai"
 )
 
@@ -173,113 +173,58 @@ func runPicker(entries []pickerEntry) string {
 	return ""
 }
 
-// ── Currency ───────────────────────────────────────────────────────────────────
-
-type currency struct {
-	code   string
-	symbol string
-	rate   float64 // conversion rate from USD (1 USD = rate units)
-}
-
-// knownSymbol returns the display symbol for a currency code.
-func knownSymbol(code string) string {
-	switch code {
-	case "USD":
-		return "$"
-	case "ZAR":
-		return "R"
-	case "EUR":
-		return "€"
-	case "GBP":
-		return "£"
-	case "JPY", "CNY":
-		return "¥"
-	case "CAD":
-		return "C$"
-	case "AUD":
-		return "A$"
-	case "CHF":
-		return "Fr"
-	case "INR":
-		return "₹"
-	case "BRL":
-		return "R$"
-	default:
-		return code + " "
-	}
-}
-
-type erAPIResp struct {
-	Result string             `json:"result"`
-	Rates  map[string]float64 `json:"rates"`
-}
-
-// fetchExchangeRate fetches a live rate from open.er-api.com (free, no key).
-func fetchExchangeRate(client *http.Client, from, to string) (float64, error) {
-	if from == to {
-		return 1.0, nil
-	}
-	url := fmt.Sprintf("https://open.er-api.com/v6/latest/%s", from)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return 1.0, err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 1.0, err
-	}
-	defer resp.Body.Close()
-
-	var out erAPIResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 1.0, err
-	}
-	rate, ok := out.Rates[to]
-	if !ok {
-		return 1.0, fmt.Errorf("currency %q not found in exchange rate response", to)
-	}
-	return rate, nil
-}
-
-// setupCurrency reads CLAYROK_CURRENCY and fetches a live rate when needed.
-func setupCurrency(client *http.Client) currency {
-	code := strings.ToUpper(strings.TrimSpace(os.Getenv("CLAYROK_CURRENCY")))
-	if code == "" {
-		code = "USD"
-	}
-	sym := knownSymbol(code)
-	if code == "USD" {
-		return currency{code: "USD", symbol: sym, rate: 1.0}
-	}
-	rate, err := fetchExchangeRate(client, "USD", code)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s\n",
-			mutedStyle.Render("currency: could not fetch "+code+" rate, falling back to USD"))
-		return currency{code: "USD", symbol: "$", rate: 1.0}
-	}
-	return currency{code: code, symbol: sym, rate: rate}
-}
-
 // ── API types ──────────────────────────────────────────────────────────────────
 type message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-type chatRequest struct {
-	Model    string    `json:"model"`
-	Messages []message `json:"messages"`
+// Responses API request (replaces the old chat completions format).
+type responsesRequest struct {
+	Model        string    `json:"model"`
+	Instructions string    `json:"instructions,omitempty"`
+	Input        []message `json:"input"`
+	Tools        []tool    `json:"tools,omitempty"`
 }
 
-type chatResponse struct {
-	Choices []struct {
-		Message message `json:"message"`
-	} `json:"choices"`
-	Error any `json:"error"`
+type tool struct {
+	Type string `json:"type"`
+}
+
+type contentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type outputItem struct {
+	Type    string        `json:"type"`
+	Role    string        `json:"role,omitempty"`
+	Content []contentPart `json:"content,omitempty"`
+}
+
+type responsesOutput struct {
+	Output []outputItem `json:"output"`
+	Error  any          `json:"error"`
 }
 
 func ask(client *http.Client, apiKey, model string, msgs []message) (string, error) {
-	body, err := json.Marshal(chatRequest{Model: model, Messages: msgs})
+	// Separate the system message (→ instructions) from conversation history.
+	var instructions string
+	var input []message
+	for _, m := range msgs {
+		if m.Role == "system" {
+			instructions = m.Content
+		} else {
+			input = append(input, m)
+		}
+	}
+
+	body, err := json.Marshal(responsesRequest{
+		Model:        model,
+		Instructions: instructions,
+		Input:        input,
+		Tools:        []tool{{Type: "web_search"}},
+	})
 	if err != nil {
 		return "", err
 	}
@@ -303,14 +248,24 @@ func ask(client *http.Client, apiKey, model string, msgs []message) (string, err
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("API returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
 	}
-	var out chatResponse
+
+	var out responsesOutput
 	if err := json.Unmarshal(data, &out); err != nil {
 		return "", err
 	}
-	if len(out.Choices) == 0 {
-		return "", errors.New("API returned no choices")
+
+	// Find the assistant's text in the output items.
+	for _, item := range out.Output {
+		if item.Type == "message" && item.Role == "assistant" {
+			for _, c := range item.Content {
+				// xAI uses "output_text"; fall back to plain "text" just in case.
+				if c.Type == "output_text" || c.Type == "text" {
+					return c.Text, nil
+				}
+			}
+		}
 	}
-	return out.Choices[0].Message.Content, nil
+	return "", errors.New("API returned no text in response")
 }
 
 // ── Language models ────────────────────────────────────────────────────────────
@@ -515,25 +470,26 @@ func fetchBalance(client *http.Client, mgmtKey, teamID string) (float64, float64
 	return dollars, pct, nil
 }
 
-func formatCredits(dollars, pct float64, cur currency) string {
-	amount := dollars * cur.rate
-	bal := lipgloss.NewStyle().Foreground(clrFg).Bold(true).
-		Render(fmt.Sprintf("%s%.2f", cur.symbol, amount))
-	if pct > 0 {
-		var pctColor lipgloss.Color
-		switch {
-		case pct > 50:
-			pctColor = clrAccent
-		case pct > 20:
-			pctColor = clrPrimary
-		default:
-			pctColor = clrDark
-		}
-		pctStr := lipgloss.NewStyle().Foreground(pctColor).
-			Render(fmt.Sprintf("(%.0f%%)", pct))
-		return bal + " " + pctStr
+func formatCredits(dollars, pct float64) string {
+	if pct < 0 {
+		return ""
 	}
-	return bal
+	// Show how much has been consumed, not how much remains.
+	usedPct := 100 - pct
+	if usedPct < 0 {
+		usedPct = 0
+	}
+	var pctColor lipgloss.Color
+	switch {
+	case usedPct < 25:
+		pctColor = clrAccent // mostly full — good
+	case usedPct < 60:
+		pctColor = clrPrimary // halfway through — caution
+	default:
+		pctColor = clrDark // running low — warning
+	}
+	return lipgloss.NewStyle().Foreground(pctColor).Bold(true).
+		Render(fmt.Sprintf("%.0f%% used", usedPct))
 }
 
 // ── App state ──────────────────────────────────────────────────────────────────
@@ -548,7 +504,7 @@ func printStatus(state *appState) {
 	fmt.Println(mutedStyle.Render(strings.Repeat("─", 48)))
 	line := mutedStyle.Render("model: ") + headerStyle.Render(state.model)
 	if state.creditStr != "" {
-		line += mutedStyle.Render("  ·  credits: ") + state.creditStr
+		line += mutedStyle.Render("  ·  spent: ") + state.creditStr
 	}
 	fmt.Println(line)
 }
@@ -670,28 +626,22 @@ func runConfig(state *appState, shortClient *http.Client) {
 	if newTeamID == "" {
 		newTeamID = "default"
 	}
-	newCurrency := os.Getenv("CLAYROK_CURRENCY")
-	if newCurrency == "" {
-		newCurrency = "USD"
-	}
-
-	form := huh.NewForm(
-		huh.NewGroup(
-			huh.NewNote().
-				Title("Required").
-				Description("Your xAI inference key — used for all chat requests.\nGet one at console.x.ai → API Keys."),
-			huh.NewInput().
-				Title("XAI_API_KEY").
-				Description("Required for Clayrok to work at all.").
-				Placeholder("xai-...").
-				EchoMode(huh.EchoModePassword).
-				Value(&newAPIKey),
-			huh.NewInput().
-				Title("GROK_MODEL").
-				Description("Default model to use (you can switch any time with /model).").
-				Placeholder("grok-3").
-				Value(&newModel),
-		),
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewNote().
+			Title("Required").
+			Description("Your xAI inference key — used for all chat requests.\nGet one at console.x.ai → API Keys."),
+		huh.NewInput().
+			Title("XAI_API_KEY").
+			Description("Required for Clayrok to work at all.").
+			Placeholder("xai-...").
+			EchoMode(huh.EchoModePassword).
+			Value(&newAPIKey),
+		huh.NewInput().
+			Title("GROK_MODEL").
+			Description("Default model to use (you can switch any time with /model).").
+			Placeholder("grok-3").
+			Value(&newModel),
+	),
 		huh.NewGroup(
 			huh.NewNote().
 				Title("Credit balance display (optional)").
@@ -713,16 +663,6 @@ func runConfig(state *appState, shortClient *http.Client) {
 				Placeholder("default").
 				Value(&newTeamID),
 		),
-		huh.NewGroup(
-			huh.NewNote().
-				Title("Display currency (optional)").
-				Description("Credit amounts are shown in USD by default.\nSet any ISO 4217 code to convert using live rates.\nExamples: ZAR, EUR, GBP, JPY, CAD, AUD, INR, BRL"),
-			huh.NewInput().
-				Title("CLAYROK_CURRENCY").
-				Description("ISO 4217 currency code.").
-				Placeholder("USD").
-				Value(&newCurrency),
-		),
 	).WithTheme(clayrokTheme()).WithShowHelp(false)
 
 	if err := form.Run(); err != nil {
@@ -737,9 +677,6 @@ func runConfig(state *appState, shortClient *http.Client) {
 	if newTeamID == "" {
 		newTeamID = "default"
 	}
-	if newCurrency == "" {
-		newCurrency = "USD"
-	}
 
 	// Build .env content.
 	var buf strings.Builder
@@ -752,7 +689,6 @@ func runConfig(state *appState, shortClient *http.Client) {
 	writeLine("GROK_MODEL", newModel)
 	writeLine("XAI_MANAGEMENT_KEY", newMgmtKey)
 	writeLine("XAI_TEAM_ID", newTeamID)
-	writeLine("CLAYROK_CURRENCY", newCurrency)
 
 	// Ensure the directory exists.
 	if err := os.MkdirAll(filepath.Join(configDir, "clayrok"), 0700); err != nil {
@@ -773,7 +709,6 @@ func runConfig(state *appState, shortClient *http.Client) {
 	os.Setenv("GROK_MODEL", newModel)
 	os.Setenv("XAI_MANAGEMENT_KEY", newMgmtKey)
 	os.Setenv("XAI_TEAM_ID", newTeamID)
-	os.Setenv("CLAYROK_CURRENCY", newCurrency)
 
 	// Update active model in state if it changed.
 	if newModel != "" && newModel != state.model {
@@ -785,12 +720,11 @@ func runConfig(state *appState, shortClient *http.Client) {
 
 	// Re-fetch credits immediately so the status bar updates without a restart.
 	if newMgmtKey != "" {
-		cur := setupCurrency(shortClient)
 		dollars, pct, err := fetchBalance(shortClient, newMgmtKey, newTeamID)
 		if err != nil {
 			state.creditStr = errStyle.Render("unavailable")
 		} else if dollars > 0 {
-			state.creditStr = formatCredits(dollars, pct, cur)
+			state.creditStr = formatCredits(dollars, pct)
 			fmt.Printf("%s %s\n",
 				mutedStyle.Render("Credits:"),
 				state.creditStr)
@@ -824,9 +758,6 @@ func main() {
 	shortClient := &http.Client{Timeout: 10 * time.Second}
 	longClient := &http.Client{Timeout: 120 * time.Second}
 
-	// Set up display currency (CLAYROK_CURRENCY=ZAR, EUR, etc.; defaults to USD).
-	cur := setupCurrency(shortClient)
-
 	systemMsg := message{Role: "system", Content: "You are a helpful Gen Z assistant, use slang where you can and you may use curse words also :) Always give your complete answer in a single response — never say you will check, look something up, or come back with more info. Give your best, most complete answer immediately. If you are unsure about something, say so and answer anyway."}
 	state := &appState{
 		model:   modelName,
@@ -844,7 +775,7 @@ func main() {
 				errStyle.Render(err.Error()))
 		} else if dollars > 0 {
 			// Only show when there is an actual prepaid balance.
-			state.creditStr = formatCredits(dollars, pct, cur)
+			state.creditStr = formatCredits(dollars, pct)
 		}
 	}
 
